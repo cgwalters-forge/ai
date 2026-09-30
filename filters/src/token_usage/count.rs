@@ -37,8 +37,11 @@ use serde::Deserialize;
 use tracing::{debug, trace};
 
 use super::{
-    StreamingTokens, TokenUsage,
-    providers::{parse_anthropic, parse_bedrock, parse_google, parse_openai},
+    META_TOKEN_MODEL, StreamingTokens, TokenUsage,
+    providers::{
+        parse_anthropic, parse_anthropic_model, parse_bedrock, parse_google, parse_google_model, parse_openai,
+        parse_openai_model,
+    },
     set_cache_token_usage, set_reasoning_token_usage, set_token_status_overflow, set_token_usage, streaming,
 };
 use crate::agentic::a2a::sse;
@@ -87,6 +90,9 @@ const META_CACHE_WRITE: &str = "token_count.cache_write";
 
 /// Metadata key for accumulated reasoning / thinking tokens (streaming).
 const META_REASONING: &str = "token_count.reasoning";
+
+/// Metadata key for the model the stream reported, published with its counts.
+const META_MODEL: &str = "token_count.model";
 
 /// Metadata key for hex-encoded JSON body buffer (non-streaming).
 const META_BUF_HEX: &str = "token_count.buf_hex";
@@ -188,6 +194,19 @@ impl ProviderKind {
         }
     }
 
+    /// Extract the model that served the response from the payload that
+    /// carries its usage (for Anthropic streams, `message_start`).
+    fn extract_model(self, payload: &[u8]) -> Option<String> {
+        match self {
+            Self::OpenAi | Self::Azure => parse_openai_model(payload),
+            // Bedrock Converse reports no model; Claude via InvokeModel uses
+            // the Anthropic body.
+            Self::Anthropic | Self::Bedrock => parse_anthropic_model(payload),
+            Self::Google => parse_google_model(payload),
+            Self::BedrockInvokeModel => None,
+        }
+    }
+
     /// Extract partial usage from providers that split counts across events.
     fn extract_streaming_tokens(self, event_data: &[u8]) -> StreamingTokens {
         match self {
@@ -207,7 +226,9 @@ impl ProviderKind {
 ///
 /// Supports both streaming (SSE) and non-streaming (JSON) responses across
 /// five providers (OpenAI, Anthropic, Google, Bedrock Converse, Azure), plus
-/// a header-only extraction path for Bedrock `InvokeModel`.
+/// a header-only extraction path for Bedrock `InvokeModel`. Alongside the
+/// counts it records the model that served the response as `token.model`,
+/// when the provider names one.
 ///
 /// # YAML
 ///
@@ -428,6 +449,9 @@ fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, da
     };
 
     publish_token_usage(ctx, usage);
+    if let Some(model) = provider.extract_model(data) {
+        ctx.set_metadata(META_TOKEN_MODEL, model);
+    }
     debug!(
         input = usage.input_tokens(),
         output = usage.output_tokens(),
@@ -435,6 +459,7 @@ fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, da
         cache_read = ?usage.cache_read_tokens(),
         cache_write = ?usage.cache_write_tokens(),
         reasoning = ?usage.reasoning_tokens(),
+        model = ctx.get_metadata(META_TOKEN_MODEL),
         "extracted token usage from JSON response"
     );
 }
@@ -530,6 +555,7 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
     store_optional_count(ctx, META_CACHE_READ, usage.cache_read_tokens());
     store_optional_count(ctx, META_CACHE_WRITE, usage.cache_write_tokens());
     store_optional_count(ctx, META_REASONING, usage.reasoning_tokens());
+    store_model(ctx, provider, payload);
 
     trace!(
         input = usage.input_tokens(),
@@ -559,6 +585,23 @@ fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: 
     merge_reported_count(ctx, META_CACHE_READ, tokens.cache_read);
     merge_reported_count(ctx, META_CACHE_WRITE, tokens.cache_write);
     merge_reported_count(ctx, META_REASONING, tokens.reasoning);
+    // Only the event that opens the message (Anthropic `message_start`)
+    // reports input, and only it names the model.
+    if tokens.input.is_some() {
+        store_model(ctx, provider, payload);
+    }
+}
+
+/// Keeps the model the first usage-carrying SSE event names until the counts
+/// are published. Providers that report usage on every event (Google) name
+/// the same model on each, so later events are not parsed again.
+fn store_model(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, payload: &[u8]) {
+    if ctx.filter_metadata.contains_key(META_MODEL) {
+        return;
+    }
+    if let Some(model) = provider.extract_model(payload) {
+        ctx.filter_metadata.insert(META_MODEL.to_owned(), model);
+    }
 }
 
 /// Merge one count into its accumulator, skipping counts the event omitted.
@@ -626,9 +669,13 @@ fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>) {
         .with_reasoning(read_accumulated(ctx, META_REASONING));
 
     publish_token_usage(ctx, usage);
+    if let Some(model) = ctx.filter_metadata.remove(META_MODEL) {
+        ctx.set_metadata(META_TOKEN_MODEL, model);
+    }
     debug!(
         input,
         output,
+        model = ctx.get_metadata(META_TOKEN_MODEL),
         total = usage.total_tokens(),
         cache_read = ?usage.cache_read_tokens(),
         cache_write = ?usage.cache_write_tokens(),

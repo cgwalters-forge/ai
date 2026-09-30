@@ -369,11 +369,146 @@ fn bedrock_converse_usage(usage: &BedrockConverseUsage) -> TokenUsage {
     TokenUsage::new(actual_input, usage.output_tokens, usage.total_tokens).with_cache(cache_read, cache_write)
 }
 
+// -----------------------------------------------------------------------------
+// Response Model
+// -----------------------------------------------------------------------------
+
+/// Longest model name recorded, the filter metadata value limit; a longer one
+/// is dropped rather than truncated.
+const MAX_MODEL_BYTES: usize = 256;
+
+/// An object whose only field of interest is the model that served it.
+#[derive(Deserialize)]
+struct ModelField {
+    /// Model name.
+    model: Option<String>,
+}
+
+/// Model fields of an `OpenAI` / Azure JSON response or SSE payload.
+#[derive(Deserialize)]
+struct OpenAiModelEnvelope {
+    /// Chat Completions responses and chunks, and non-streaming Responses API
+    /// responses.
+    model: Option<String>,
+
+    /// Responses API streaming events nest the response object.
+    response: Option<ModelField>,
+}
+
+/// Model fields of an `Anthropic` JSON response or SSE payload.
+#[derive(Deserialize)]
+struct AnthropicModelEnvelope {
+    /// Non-streaming Messages responses (and Claude via Bedrock `InvokeModel`).
+    model: Option<String>,
+
+    /// `message_start` events nest the message object.
+    message: Option<ModelField>,
+}
+
+/// Model field of a Google `Gemini` response.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleModelEnvelope {
+    /// Model version that served the request.
+    model_version: Option<String>,
+}
+
+/// Model that served an `OpenAI` / Azure response, from the same JSON body
+/// or SSE payload that carries its usage.
+pub(super) fn parse_openai_model(body: &[u8]) -> Option<String> {
+    let envelope: OpenAiModelEnvelope = serde_json::from_slice(body).ok()?;
+    bounded_model(envelope.model.or_else(|| envelope.response?.model))
+}
+
+/// Model that served an `Anthropic` response: a non-streaming body or a
+/// `message_start` event.
+pub(super) fn parse_anthropic_model(body: &[u8]) -> Option<String> {
+    let envelope: AnthropicModelEnvelope = serde_json::from_slice(body).ok()?;
+    bounded_model(envelope.model.or_else(|| envelope.message?.model))
+}
+
+/// Model version that served a Google `Gemini` response.
+pub(super) fn parse_google_model(body: &[u8]) -> Option<String> {
+    let envelope: GoogleModelEnvelope = serde_json::from_slice(body).ok()?;
+    bounded_model(envelope.model_version)
+}
+
+/// Drops an empty or oversized model name, which a provider should never send
+/// and which must not grow filter metadata without bound.
+fn bounded_model(model: Option<String>) -> Option<String> {
+    model.filter(|model| !model.is_empty() && model.len() <= MAX_MODEL_BYTES)
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // Response model
+    // -------------------------------------------------------------------------
+
+    /// A model parser case: name, parser, payload and the model it should
+    /// find.
+    type ModelCase<'a> = (&'a str, fn(&[u8]) -> Option<String>, &'a [u8], Option<&'a str>);
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one table of cases")]
+    fn response_model_per_provider_payload() {
+        let oversized = format!(r#"{{"model":"{}"}}"#, "m".repeat(MAX_MODEL_BYTES + 1));
+        let cases: [ModelCase<'_>; 11] = [
+            (
+                "chat completions",
+                parse_openai_model,
+                br#"{"model":"gpt-4o","usage":{}}"#,
+                Some("gpt-4o"),
+            ),
+            (
+                "responses completed event",
+                parse_openai_model,
+                br#"{"type":"response.completed","response":{"model":"gpt-5","usage":{}}}"#,
+                Some("gpt-5"),
+            ),
+            (
+                "responses without model",
+                parse_openai_model,
+                br#"{"response":{"usage":{}}}"#,
+                None,
+            ),
+            ("openai malformed", parse_openai_model, b"{", None),
+            (
+                "anthropic json",
+                parse_anthropic_model,
+                br#"{"model":"claude-opus","usage":{}}"#,
+                Some("claude-opus"),
+            ),
+            (
+                "anthropic message_start",
+                parse_anthropic_model,
+                br#"{"type":"message_start","message":{"model":"claude-sonnet","usage":{}}}"#,
+                Some("claude-sonnet"),
+            ),
+            (
+                "anthropic message_delta",
+                parse_anthropic_model,
+                br#"{"type":"message_delta","usage":{}}"#,
+                None,
+            ),
+            (
+                "google",
+                parse_google_model,
+                br#"{"modelVersion":"gemini-2.5-pro"}"#,
+                Some("gemini-2.5-pro"),
+            ),
+            ("empty", parse_openai_model, br#"{"model":""}"#, None),
+            ("not a string", parse_anthropic_model, br#"{"model":7}"#, None),
+            ("oversized", parse_openai_model, oversized.as_bytes(), None),
+        ];
+        for (name, parse, body, expected) in cases {
+            assert_eq!(parse(body).as_deref(), expected, "{name}");
+        }
+    }
 
     // -------------------------------------------------------------------------
     // parse_openai edge cases

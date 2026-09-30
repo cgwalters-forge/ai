@@ -55,6 +55,13 @@ pub const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 /// Metadata key for reasoning / thinking tokens reported by the provider.
 pub const META_TOKEN_REASONING: &str = "token.reasoning";
 
+/// Metadata key for the model that served the response, as the provider
+/// named it in the body that carried the usage.
+///
+/// Set only alongside the counts, and only when the provider reported a
+/// model: Bedrock Converse and `InvokeModel` token headers never do.
+pub const META_TOKEN_MODEL: &str = "token.model";
+
 /// Unified token usage extracted from an AI provider response.
 ///
 /// Providers that support prompt caching also report how much of the input was

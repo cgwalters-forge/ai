@@ -392,6 +392,106 @@ async fn json_clears_working_metadata() {
 }
 
 // -----------------------------------------------------------------------------
+// Response Model
+// -----------------------------------------------------------------------------
+
+/// A `token.model` case: name, provider, content type, response body and the
+/// model it should publish.
+type ModelCase = (
+    &'static str,
+    ProviderKind,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+);
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one table of cases, per provider and path")]
+async fn model_is_published_with_usage() {
+    const JSON: &str = "application/json";
+    const SSE: &str = "text/event-stream";
+    let cases: [ModelCase; 9] = [
+        (
+            "openai chat json",
+            ProviderKind::OpenAi,
+            JSON,
+            r#"{"model":"gpt-4o","usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            Some("gpt-4o"),
+        ),
+        (
+            "openai chat sse",
+            ProviderKind::OpenAi,
+            SSE,
+            concat!(
+                "data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"model\":\"gpt-4o\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            Some("gpt-4o"),
+        ),
+        (
+            "openai responses sse",
+            ProviderKind::OpenAi,
+            SSE,
+            concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"model\":\"early\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+            ),
+            Some("gpt-5"),
+        ),
+        (
+            "azure json",
+            ProviderKind::Azure,
+            JSON,
+            r#"{"model":"gpt-4o","usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            Some("gpt-4o"),
+        ),
+        (
+            "anthropic json",
+            ProviderKind::Anthropic,
+            JSON,
+            r#"{"model":"claude-opus","usage":{"input_tokens":1,"output_tokens":2}}"#,
+            Some("claude-opus"),
+        ),
+        (
+            "anthropic sse",
+            ProviderKind::Anthropic,
+            SSE,
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":1}}}\n\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\n",
+            ),
+            Some("claude-sonnet"),
+        ),
+        (
+            "google json",
+            ProviderKind::Google,
+            JSON,
+            r#"{"modelVersion":"gemini-2.5-pro","usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}"#,
+            Some("gemini-2.5-pro"),
+        ),
+        (
+            "bedrock converse json",
+            ProviderKind::Bedrock,
+            JSON,
+            r#"{"usage":{"inputTokens":1,"outputTokens":2}}"#,
+            None,
+        ),
+        (
+            "no usage, no model",
+            ProviderKind::OpenAi,
+            JSON,
+            r#"{"model":"gpt-4o"}"#,
+            None,
+        ),
+    ];
+    for (name, provider, content_type, body, expected) in cases {
+        let model = run_metadata_extraction(provider, content_type, body.as_bytes(), META_TOKEN_MODEL).await;
+        assert_eq!(model.as_deref(), expected, "{name}");
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Streaming SSE: End-to-End
 // -----------------------------------------------------------------------------
 
@@ -1721,6 +1821,17 @@ async fn run_cache_extraction(
 /// Run a full `on_response` -> `on_response_body` cycle and return the
 /// reasoning metadata for either the JSON or the SSE path.
 async fn run_reasoning_extraction(provider: ProviderKind, content_type: &str, body_bytes: &[u8]) -> Option<String> {
+    run_metadata_extraction(provider, content_type, body_bytes, "token.reasoning").await
+}
+
+/// Run a full `on_response` -> `on_response_body` cycle and return one
+/// published metadata value for either the JSON or the SSE path.
+async fn run_metadata_extraction(
+    provider: ProviderKind,
+    content_type: &str,
+    body_bytes: &[u8],
+    key: &str,
+) -> Option<String> {
     let filter = make_filter(provider);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1733,7 +1844,7 @@ async fn run_reasoning_extraction(provider: ProviderKind, content_type: &str, bo
     let mut body = Some(Bytes::copy_from_slice(body_bytes));
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    ctx.get_metadata("token.reasoning").map(str::to_owned)
+    ctx.get_metadata(key).map(str::to_owned)
 }
 
 /// Run a full `on_response` -> `on_response_body` cycle for SSE extraction.
