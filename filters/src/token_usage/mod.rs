@@ -6,6 +6,10 @@
 //! This module owns the complete in-process token usage flow: parsing
 //! provider responses, storing normalized counts in filter metadata, and
 //! optionally exposing those counts as downstream response headers.
+//!
+//! The `META_TOKEN_*` keys are public so that filters built outside this
+//! crate can read the counts `token_count` records without repeating the
+//! strings.
 
 mod count;
 mod headers;
@@ -18,42 +22,45 @@ pub use headers::TokenUsageHeadersFilter;
 use praxis_filter::HttpFilterContext;
 pub use stream_usage::StreamUsageInjectFilter;
 
-/// Metadata key for the input token count.
-///
-/// `pub(crate)` so `token_rate_limit` can weight this key without
-/// duplicating the string — see [`ai#351`](https://github.com/praxis-proxy/ai/issues/351).
-pub(crate) const META_TOKEN_INPUT: &str = "token.input";
+/// Metadata key for the input token count, cached tokens included.
+pub const META_TOKEN_INPUT: &str = "token.input";
 
 /// Metadata key for the output token count.
-pub(crate) const META_TOKEN_OUTPUT: &str = "token.output";
+pub const META_TOKEN_OUTPUT: &str = "token.output";
 
 /// Metadata key for the total token count.
 ///
-/// `pub(crate)` so `token_rate_limit`'s reconciliation path can reference
-/// this constant directly instead of duplicating the string literal — see
-/// the duplication risk this avoids: [`ai#351`](https://github.com/praxis-proxy/ai/issues/351)
-/// (cached-token double-counting caused by a second, independent parsing
-/// path drifting from this one).
-pub(crate) const META_TOKEN_TOTAL: &str = "token.total";
+/// Consumers reference this constant rather than the string so that no
+/// second, independent reading of the counts drifts from this one; see
+/// [`ai#351`](https://github.com/praxis-proxy/ai/issues/351) (cached-token
+/// double-counting caused by exactly that).
+pub const META_TOKEN_TOTAL: &str = "token.total";
 
 /// Metadata key signaling that usage could not be captured because the
 /// response exceeded the configured capture limit. Absent on success,
 /// including when the provider genuinely reported no usage — consumers
 /// must not treat "no counts" the same as "counts unavailable."
-pub(crate) const META_TOKEN_STATUS: &str = "token.status";
+pub const META_TOKEN_STATUS: &str = "token.status";
 
 /// Value of [`META_TOKEN_STATUS`] when capture was abandoned due to
 /// exceeding the configured size limit.
-pub(crate) const TOKEN_STATUS_OVERFLOW: &str = "overflow";
+pub const TOKEN_STATUS_OVERFLOW: &str = "overflow";
 
 /// Metadata key for input tokens served from the provider's prompt cache.
-pub(crate) const META_TOKEN_CACHE_READ: &str = "token.cache_read";
+pub const META_TOKEN_CACHE_READ: &str = "token.cache_read";
 
 /// Metadata key for input tokens written to the provider's prompt cache.
-pub(crate) const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
+pub const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 
 /// Metadata key for reasoning / thinking tokens reported by the provider.
-pub(crate) const META_TOKEN_REASONING: &str = "token.reasoning";
+pub const META_TOKEN_REASONING: &str = "token.reasoning";
+
+/// Metadata key for the model that served the response, as the provider
+/// named it in the body that carried the usage.
+///
+/// Set only alongside the counts, and only when the provider reported a
+/// model: Bedrock Converse and `InvokeModel` token headers never do.
+pub const META_TOKEN_MODEL: &str = "token.model";
 
 /// Unified token usage extracted from an AI provider response.
 ///

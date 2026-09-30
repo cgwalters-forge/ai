@@ -7,7 +7,7 @@ Extracts token usage from AI inference responses and writes unified counts to [`
 
 ## Configuration Notes
 
-Supports both streaming (SSE) and non-streaming (JSON) responses across five providers (OpenAI, Anthropic, Google, Bedrock Converse, Azure), plus a header-only extraction path for Bedrock `InvokeModel`.
+Supports both streaming (SSE) and non-streaming (JSON) responses across five providers (OpenAI, Anthropic, Google, Bedrock Converse, Azure), plus a header-only extraction path for Bedrock `InvokeModel`. Alongside the counts it records the model that served the response as `token.model`, when the provider names one.
 
 ## Configuration
 

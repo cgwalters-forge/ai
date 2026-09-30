@@ -56,7 +56,11 @@ pub use store_readiness::{FILTER_NAME as STORE_READINESS_GATE_FILTER_NAME, Store
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
-pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter};
+pub use token_usage::{
+    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_MODEL, META_TOKEN_OUTPUT,
+    META_TOKEN_REASONING, META_TOKEN_STATUS, META_TOKEN_TOTAL, StreamUsageInjectFilter, TOKEN_STATUS_OVERFLOW,
+    TokenCountFilter, TokenUsageHeadersFilter,
+};
 
 /// Build an isolated client after installing the process-wide crypto provider.
 ///

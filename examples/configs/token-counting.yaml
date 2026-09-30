@@ -34,6 +34,12 @@
 # An absent key means the provider did not report reasoning; a zero
 # means it reported none.
 #
+# The model that served the response is recorded as token.model, from
+# the body that carried the usage: the top-level model (OpenAI, Azure,
+# Anthropic), response.model on Responses API events, message.model on
+# Anthropic's message_start, or modelVersion (Google). Bedrock Converse
+# names no model, so the key is absent there.
+#
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/token-counting.yaml
 #   curl http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'

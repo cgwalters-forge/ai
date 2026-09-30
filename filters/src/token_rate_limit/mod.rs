@@ -108,7 +108,10 @@ mod weights;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -142,24 +145,60 @@ use self::{
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Metadata key stashing this request's reservation ID, read back during
-/// response-phase reconciliation.
-const META_RESERVATION_ID: &str = "token_rate_limit.reservation_id";
+/// Prefix of the metadata keys each filter instance stashes a request's
+/// admission under, read back during response-phase reconciliation.
+const META_PREFIX: &str = "token_rate_limit";
 
-/// Metadata key stashing the resolved bucket key, read back in
-/// reconciliation so it operates on the same budget `on_request` reserved
-/// from.
-const META_BUCKET_KEY: &str = "token_rate_limit.bucket_key";
+/// Source of each filter instance's metadata key namespace.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
-/// Metadata key stashing the index of the [`CompiledRule`] that admitted
-/// this request, so reconciliation settles against the same rule's
-/// backend/estimate even when other rules exist.
-const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
+/// The metadata keys one filter instance stashes a request's admission
+/// under.
+///
+/// Namespaced per instance: several `token_rate_limit` filters can admit
+/// the same request (say, a per-caller budget and a shared one), and with
+/// shared keys the last one to admit it would overwrite the others'
+/// reservations, which would then never be reconciled. A config reload
+/// builds new instances, but a request's response phase runs on the
+/// pipeline, and so the instances, that admitted it.
+#[derive(Debug)]
+struct MetadataKeys {
+    /// This request's reservation ID.
+    reservation_id: String,
 
-/// Metadata key stashing this request's computed estimate, so
-/// reconciliation can use the actual per-request estimate (not just
-/// the compiled default) for its settlement math.
-const META_ESTIMATE: &str = "token_rate_limit.estimate";
+    /// The resolved bucket key, so reconciliation operates on the same
+    /// budget `on_request` reserved from.
+    bucket_key: String,
+
+    /// The index of the [`CompiledRule`] that admitted this request, so
+    /// reconciliation settles against the same rule's backend/estimate even
+    /// when other rules exist.
+    rule_index: String,
+
+    /// This request's computed estimate, so reconciliation can use the
+    /// actual per-request estimate (not just the compiled default) for its
+    /// settlement math.
+    estimate: String,
+}
+
+impl MetadataKeys {
+    /// Keys in a namespace no other filter instance of this process uses.
+    fn unique() -> Self {
+        let instance = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        let key = |field: &str| format!("{META_PREFIX}.{instance}.{field}");
+        Self {
+            reservation_id: key("reservation_id"),
+            bucket_key: key("bucket_key"),
+            rule_index: key("rule_index"),
+            estimate: key("estimate"),
+        }
+    }
+
+    /// Every key, for cleanup.
+    fn all(&self) -> [&str; 4] {
+        [&self.reservation_id, &self.bucket_key, &self.rule_index, &self.estimate]
+    }
+}
 
 /// The budget key used by the backward-compatible global key mode.
 pub(super) const FALLBACK_KEY: &str = "__fallback__";
@@ -1189,6 +1228,9 @@ pub struct TokenRateLimitFilter {
 
     /// Monotonic clock reference; all timestamps are offsets from this.
     epoch: Instant,
+
+    /// Where this instance stashes each request's admission.
+    meta: MetadataKeys,
 }
 
 impl TokenRateLimitFilter {
@@ -1231,6 +1273,7 @@ impl TokenRateLimitFilter {
             needs_body,
             key_spec,
             epoch: Instant::now(),
+            meta: MetadataKeys::unique(),
         }))
     }
 
@@ -1319,6 +1362,7 @@ impl TokenRateLimitFilter {
     /// Record metrics/metadata for an admitted reservation.
     fn record_admission(
         ctx: &mut HttpFilterContext<'_>,
+        meta: &MetadataKeys,
         rule_index: usize,
         rule: &CompiledRule,
         admitted: AdmittedReservation,
@@ -1327,9 +1371,9 @@ impl TokenRateLimitFilter {
         record_reserved_metric(&rule.name, admitted.estimate);
         record_state_metrics(&rule.name, rule.backend.as_ref());
         record_accounting_admission(rule, "admitted", admitted.estimate, "reserved");
-        ctx.set_metadata(META_RESERVATION_ID, admitted.reservation_id.to_string());
-        ctx.set_metadata(META_BUCKET_KEY, admitted.key);
-        ctx.set_metadata(META_RULE_INDEX, rule_index.to_string());
+        ctx.set_metadata(meta.reservation_id.as_str(), admitted.reservation_id.to_string());
+        ctx.set_metadata(meta.bucket_key.as_str(), admitted.key);
+        ctx.set_metadata(meta.rule_index.as_str(), rule_index.to_string());
     }
 
     /// Build the 429 rejection for a denied reservation, including the
@@ -1363,7 +1407,7 @@ impl TokenRateLimitFilter {
     )]
     fn handle_reserve_outcome(
         ctx: &mut HttpFilterContext<'_>,
-        rule_index: usize,
+        meta: &MetadataKeys,
         rule: &CompiledRule,
         pending: PendingReservation,
         outcome: Result<BackendReserve, BackendError>,
@@ -1379,8 +1423,8 @@ impl TokenRateLimitFilter {
                     reservation_id,
                     estimate,
                 };
-                Self::record_admission(ctx, rule_index, rule, admitted);
-                ctx.set_metadata(META_ESTIMATE, pending.request_estimate.to_string());
+                Self::record_admission(ctx, meta, pending.rule_index, rule, admitted);
+                ctx.set_metadata(meta.estimate.as_str(), pending.request_estimate.to_string());
                 Self::evaluate_tiers(ctx, rule, usage_after);
                 record_admission_span(ctx, rule, pending.request_estimate, "admitted");
                 FilterAction::Continue
@@ -1479,18 +1523,18 @@ impl TokenRateLimitFilter {
     /// this exchange, if all three are present and the rule index still
     /// resolves -- the shared precondition for [`Self::reconcile`].
     fn reconciliation_context(&self, ctx: &HttpFilterContext<'_>) -> Option<(ReconcileRequest, &CompiledRule)> {
-        let reservation_id = parse_u64_meta(ctx, META_RESERVATION_ID)?;
-        let key = ctx.get_metadata(META_BUCKET_KEY).map(str::to_owned)?;
+        let reservation_id = parse_u64_meta(ctx, &self.meta.reservation_id)?;
+        let key = ctx.get_metadata(&self.meta.bucket_key).map(str::to_owned)?;
         let rule = ctx
-            .get_metadata(META_RULE_INDEX)
+            .get_metadata(&self.meta.rule_index)
             .and_then(|v| v.parse::<usize>().ok())
             .and_then(|index| self.rules.get(index))?;
         let actual = weighted_cost(UsageCounts::from_context(ctx), rule.weights);
         if actual.is_none() {
             tracing::trace!("token_rate_limit: no usable token usage metadata at end of stream, charging at estimate");
         }
-        let Some(estimate) = parse_u64_meta(ctx, META_ESTIMATE) else {
-            tracing::warn!("token_rate_limit: META_ESTIMATE missing at reconciliation, skipping");
+        let Some(estimate) = parse_u64_meta(ctx, &self.meta.estimate) else {
+            tracing::warn!("token_rate_limit: estimate metadata missing at reconciliation, skipping");
             return None;
         };
         let request = ReconcileRequest {
@@ -1542,10 +1586,12 @@ impl TokenRateLimitFilter {
     }
 }
 
-/// Bundle for the budget key and computed estimate awaiting a backend
+/// Bundle for the rule, budget key and computed estimate awaiting a backend
 /// `reserve()` call, keeping [`TokenRateLimitFilter::handle_reserve_outcome`]
 /// within clippy's argument-count budget.
 struct PendingReservation {
+    /// The index of the rule reserving.
+    rule_index: usize,
     /// The budget key this reservation will use.
     key: String,
     /// The computed token estimate for this request.
@@ -1797,10 +1843,11 @@ impl HttpFilter for TokenRateLimitFilter {
             })
             .await;
         let pending = PendingReservation {
+            rule_index,
             key,
             request_estimate: estimate,
         };
-        Ok(Self::handle_reserve_outcome(ctx, rule_index, rule, pending, outcome))
+        Ok(Self::handle_reserve_outcome(ctx, &self.meta, rule, pending, outcome))
     }
 
     async fn on_request_body(
@@ -1819,9 +1866,7 @@ impl HttpFilter for TokenRateLimitFilter {
         Self::cleanup_and_record_state(rule, now_ms);
 
         let body_probe = parse_body_probe(body);
-        let estimate = rule.estimation.estimate(&ctx.request.headers, body_probe.as_ref());
-
-        let Some(estimate) = estimate else {
+        let Some(estimate) = rule.estimation.estimate(&ctx.request.headers, body_probe.as_ref()) else {
             return Ok(FilterAction::Continue);
         };
 
@@ -1838,10 +1883,11 @@ impl HttpFilter for TokenRateLimitFilter {
             })
             .await;
         let pending = PendingReservation {
+            rule_index,
             key,
             request_estimate: estimate,
         };
-        Ok(Self::handle_reserve_outcome(ctx, rule_index, rule, pending, outcome))
+        Ok(Self::handle_reserve_outcome(ctx, &self.meta, rule, pending, outcome))
     }
 
     fn on_response_body(
@@ -1852,10 +1898,9 @@ impl HttpFilter for TokenRateLimitFilter {
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
             self.reconcile(ctx);
-            ctx.filter_metadata.remove(META_RESERVATION_ID);
-            ctx.filter_metadata.remove(META_BUCKET_KEY);
-            ctx.filter_metadata.remove(META_RULE_INDEX);
-            ctx.filter_metadata.remove(META_ESTIMATE);
+            for key in self.meta.all() {
+                ctx.filter_metadata.remove(key);
+            }
             #[cfg(feature = "opentelemetry")]
             ctx.extensions.remove::<crate::opentelemetry::TokenRateLimitSpan>();
         }
@@ -2041,6 +2086,7 @@ mod backend_injection_tests {
             needs_body: false,
             key_spec: super::CompiledKeySpec::global(),
             epoch: std::time::Instant::now(),
+            meta: super::MetadataKeys::unique(),
         };
 
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");

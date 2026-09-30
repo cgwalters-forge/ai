@@ -38,6 +38,22 @@ fn single_rule_yaml_with(top_level: &str, body: &str) -> serde_yaml::Value {
     serde_yaml::from_str(&format!("{top_level}\n{}", single_rule(body))).unwrap()
 }
 
+/// The metadata key under which the filter stashed its admission's `field`:
+/// each filter instance has a namespace of its own. Assumes one filter
+/// admitted the request; with several, any one's key may be returned.
+fn stashed_key(ctx: &praxis_filter::HttpFilterContext<'_>, field: &str) -> Option<String> {
+    let suffix = format!(".{field}");
+    ctx.filter_metadata
+        .keys()
+        .find(|key| key.starts_with("token_rate_limit.") && key.ends_with(&suffix))
+        .cloned()
+}
+
+/// The value the filter stashed as its admission's `field`.
+fn stashed<'a>(ctx: &'a praxis_filter::HttpFilterContext<'_>, field: &str) -> Option<&'a str> {
+    ctx.get_metadata(&stashed_key(ctx, field)?)
+}
+
 /// Build a request carrying a single extra header, for `match` tests.
 fn make_request_with_header(name: &str, value: &str) -> praxis_filter::Request {
     let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -747,7 +763,7 @@ async fn admits_request_within_budget() {
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "should admit within budget");
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        stashed(&ctx, "reservation_id").is_some(),
         "reservation id should be stashed for reconciliation"
     );
 }
@@ -995,7 +1011,7 @@ async fn reconcile_is_a_noop_without_prior_admission_metadata() {
     ));
 }
 
-/// Missing `META_ESTIMATE` must skip settlement rather than treat the
+/// A missing estimate must skip settlement rather than treat the
 /// estimate as 0 (which would debit `actual - 0` on top of the original
 /// reservation and over-charge the window).
 #[tokio::test]
@@ -1009,7 +1025,8 @@ async fn missing_meta_estimate_skips_reconciliation_instead_of_settling_at_zero(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    ctx.filter_metadata.remove(super::META_ESTIMATE);
+    let estimate_key = stashed_key(&ctx, "estimate").unwrap();
+    ctx.filter_metadata.remove(&estimate_key);
     ctx.set_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
     assert!(matches!(
@@ -1025,6 +1042,46 @@ async fn missing_meta_estimate_skips_reconciliation_instead_of_settling_at_zero(
         matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
         "skipping reconcile must leave the original 500-token reservation, not 700"
     );
+}
+
+/// Two filters admitting one request, say a per-caller budget and a shared
+/// one, each reconcile their own reservation: neither overwrites the
+/// other's admission metadata.
+#[tokio::test]
+async fn filters_admitting_one_request_reconcile_their_own_reservations() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 600");
+    let filters = [
+        TokenRateLimitFilter::from_config(&yaml).unwrap(),
+        TokenRateLimitFilter::from_config(&yaml).unwrap(),
+    ];
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    for filter in &filters {
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+    }
+    ctx.set_metadata(META_TOKEN_TOTAL, "100");
+    for filter in filters.iter().rev() {
+        let mut body = None;
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    }
+    assert!(
+        stashed_key(&ctx, "reservation_id").is_none(),
+        "reconciliation should clear every filter's admission metadata"
+    );
+
+    // Each settled at 100, so another 600 fits in both; it would not in a
+    // filter whose 600-token reservation was left open.
+    for (index, filter) in filters.iter().enumerate() {
+        let mut second = crate::test_utils::make_filter_context(&req);
+        assert!(
+            matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
+            "filter {index} should have settled its own reservation"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1122,6 +1179,7 @@ fn debug_format_lists_configured_rule_names() {
         needs_body,
         key_spec: super::compile_key_spec(cfg.key).unwrap(),
         epoch: std::time::Instant::now(),
+        meta: super::MetadataKeys::unique(),
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -1415,7 +1473,7 @@ async fn input_plus_max_tokens_strategy_computes_from_body_and_content_length() 
         "estimate = ceil(body_len/4) + 200 should be within capacity"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        stashed(&ctx, "reservation_id").is_some(),
         "reservation should have been created"
     );
 }
@@ -1439,7 +1497,7 @@ async fn malformed_json_body_uses_fallback_estimate() {
         "malformed JSON should fall back to fallback_estimate=100 and admit"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        stashed(&ctx, "reservation_id").is_some(),
         "fallback estimate should create a reservation"
     );
 }
@@ -1925,7 +1983,7 @@ async fn fixed_estimation_strategy_reserves_like_legacy_reserved_tokens() {
         matches!(action, FilterAction::Continue),
         "fixed estimation should admit within budget"
     );
-    assert!(ctx.get_metadata("token_rate_limit.reservation_id").is_some());
+    assert!(stashed(&ctx, "reservation_id").is_some());
 }
 
 #[tokio::test]
@@ -1944,7 +2002,7 @@ async fn max_tokens_strategy_defers_to_on_request_body() {
         "on_request should pass through when needs_body=true"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        stashed(&ctx, "reservation_id").is_none(),
         "no reservation should be made in on_request when needs_body=true"
     );
 }
@@ -1968,11 +2026,11 @@ async fn max_tokens_strategy_extracts_from_body_and_reserves() {
         "should admit with max_tokens=500 within capacity=1000"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        stashed(&ctx, "reservation_id").is_some(),
         "reservation should be made in on_request_body"
     );
 
-    let estimate_meta = ctx.get_metadata("token_rate_limit.estimate").unwrap();
+    let estimate_meta = stashed(&ctx, "estimate").unwrap();
     assert_eq!(
         estimate_meta, "500",
         "estimate metadata should reflect extracted max_tokens"
@@ -1995,7 +2053,7 @@ async fn max_tokens_strategy_prefers_max_tokens_over_max_completion_tokens() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "300",
         "max_tokens should take priority over max_completion_tokens"
     );
@@ -2015,7 +2073,7 @@ async fn max_tokens_strategy_falls_back_to_max_completion_tokens() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "250",
         "should fall back to max_completion_tokens when max_tokens is absent"
     );
@@ -2036,7 +2094,7 @@ async fn max_tokens_strategy_uses_fallback_when_body_has_no_tokens_field() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "42",
         "should fall back to fallback_estimate when body has no max_tokens"
     );
@@ -2059,7 +2117,7 @@ async fn max_tokens_strategy_admits_without_reservation_when_no_fallback_and_no_
         "should admit without reservation when strategy can't extract a value and no fallback"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        stashed(&ctx, "reservation_id").is_none(),
         "no reservation should be made when estimate is unavailable"
     );
 }
@@ -2078,11 +2136,7 @@ async fn max_tokens_strategy_applies_multiplier() {
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
-        "150",
-        "100 * 1.5 = 150"
-    );
+    assert_eq!(stashed(&ctx, "estimate").unwrap(), "150", "100 * 1.5 = 150");
 }
 
 #[tokio::test]
@@ -2129,7 +2183,7 @@ async fn on_request_body_is_noop_before_end_of_stream() {
         "should continue without reservation before end_of_stream"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        stashed(&ctx, "reservation_id").is_none(),
         "no reservation before end_of_stream"
     );
 }
@@ -2149,7 +2203,7 @@ async fn model_scaled_strategy_applies_per_model_multiplier() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "200",
         "100 * 2.0 (gpt-4 multiplier) = 200"
     );
@@ -2170,7 +2224,7 @@ async fn model_scaled_strategy_uses_default_multiplier_for_unknown_model() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "150",
         "100 * 1.5 (default multiplier for unknown model) = 150"
     );
@@ -2195,7 +2249,7 @@ async fn model_scaled_strategy_reads_model_from_x_model_header_fallback() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "300",
         "100 * 3.0 (gpt-4 via x-model header) = 300"
     );
@@ -2310,7 +2364,7 @@ async fn empty_body_uses_fallback_estimate() {
         "empty body should fall back to fallback_estimate=75 and admit"
     );
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "75",
         "estimate should be the fallback when body is absent"
     );
@@ -2327,7 +2381,7 @@ async fn mixed_rules_fixed_strategy_ignores_body_when_filter_buffers() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "200",
         "fixed-strategy rule must use its constant (200), not the body's max_tokens"
     );
@@ -2344,7 +2398,7 @@ async fn mixed_rules_body_dependent_strategy_extracts_from_body() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "300",
         "body-dependent rule must use extracted max_tokens (300)"
     );
@@ -2392,7 +2446,7 @@ async fn input_plus_max_tokens_defaults_to_zero_input_when_content_length_absent
     assert!(matches!(action, FilterAction::Continue));
     // input = ceil(0 / 4.0) = 0, output = 400, total = 400
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "400",
         "missing Content-Length should default input to 0, estimate = 0 + max_tokens"
     );
@@ -2414,7 +2468,7 @@ async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        stashed(&ctx, "estimate").unwrap(),
         "300",
         "gpt-4 with outer multiplier 1.5 × model multiplier 2.0 = 3.0 × 100 = 300"
     );
